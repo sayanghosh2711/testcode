@@ -25,6 +25,7 @@ param(
     [int]   $Limit      = 0,         # only process the first N projects (testing)
     [switch]$DryRun,                 # report only, never lock anything
     [int]   $ReportTimeoutMinutes = 5,  # how long to wait for each XML report
+    [string[]]$Resume = @(),         # previous report CSV(s): skip projects already done, merge into one report
     [switch]$Diagnose,               # print what the API returns for ONE project, change nothing
     [string]$Token      = $env:CX_TOKEN,    # bearer token OR the full Cookie value - auto-detected
     [string]$OutDir     = ".",
@@ -222,6 +223,21 @@ function Get-LatestScan([int]$ProjectId) {
     return ($scans | Sort-Object { $_.dateAndTime.startedOn } -Descending | Select-Object -First 1)
 }
 
+$script:StatsCache = @{}
+function Get-ScanStats([int]$ScanId) {
+    if (-not $script:StatsCache.ContainsKey($ScanId)) {
+        $script:StatsCache[$ScanId] = Get-CxRest "/sast/scans/$ScanId/resultsStatistics"
+    }
+    return $script:StatsCache[$ScanId]
+}
+function Get-StatTotal($st) {
+    $t = 0
+    foreach ($n in 'criticalSeverity', 'highSeverity', 'mediumSeverity', 'lowSeverity', 'infoSeverity') {
+        if ($st.PSObject.Properties[$n] -and $null -ne $st.$n) { $t += [int]$st.$n }
+    }
+    return $t
+}
+
 $script:RiskNote = ''
 function Get-ScanRiskScore($Scan) {
     # Risk Level Score = the number in brackets next to the coloured bar in the UI.
@@ -233,8 +249,11 @@ function Get-ScanRiskScore($Scan) {
     $v = Get-NumericProp $Scan $names 'risk' 'severity'
     if ($null -eq $v -or $v -ge 0) { return $v }
 
-    try   { $st = Get-CxRest "/sast/scans/$($Scan.id)/resultsStatistics" }
-    catch { $script:RiskNote = "scanRisk=$v and result counts unavailable"; return $null }
+    try   { $st = Get-ScanStats $Scan.id }
+    catch {
+        if ("$_" -match 'HTTP 401') { throw }      # login expired - must not be mistaken for "no score"
+        $script:RiskNote = "scanRisk=$v and result counts unavailable"; return $null
+    }
     $crit = 0; if ($st.PSObject.Properties['criticalSeverity']) { $crit = [int]$st.criticalSeverity }
     $chm  = $crit + [int]$st.highSeverity + [int]$st.mediumSeverity
     if ($chm -eq 0) {
@@ -395,7 +414,17 @@ function Invoke-CxProject($Project) {
         }
 
         # ---- to verify ----------------------------------------------------- #
-        $tv = Get-ToVerifyResults $sid
+        # A scan with zero results of any severity cannot have To Verify results,
+        # so the (slow) XML report is only requested when there is something in it.
+        $total = $null
+        try { $total = Get-StatTotal (Get-ScanStats $sid) } catch { if ("$_" -match 'HTTP 401') { throw } }
+        if ($total -eq 0) {
+            $tv = @()
+            if ($row['Note']) { $row['Note'] += '; ' }
+            $row['Note'] += 'scan has no results - XML report not needed'
+        } else {
+            $tv = Get-ToVerifyResults $sid
+        }
         $row['To Verify - Total'] = $tv.Count
         foreach ($r in $tv) {
             $sev = ConvertTo-SeverityName $r.Severity
@@ -533,13 +562,30 @@ else          { Write-Host "$($projects.Count) project(s) matched. Only opening 
 if ($DryRun)  { Write-Host "DRY RUN - nothing will be locked." -ForegroundColor Yellow }
 
 $results = @()
+$previous = @()
+if ($Resume.Count -gt 0) {
+    $done = @{}
+    foreach ($f in $Resume) {
+        if (-not (Test-Path $f)) { throw "Resume file not found: $f" }
+        foreach ($r in (Import-Csv -Path $f)) {
+            $finished = ($r.'Needs Triage' -in @('YES', 'NO', 'N/A')) -or
+                        ($r.'Needs Triage' -eq 'SKIPPED' -and "$($r.'Risk Score')" -ne '')
+            if ($finished) { $done["$($r.'Project ID')"] = $r }
+        }
+    }
+    $previous = @($done.Values)
+    $before = $projects.Count
+    $projects = @($projects | Where-Object { -not $done.ContainsKey("$($_.id)") })
+    Write-Host "Resume: $($before - $projects.Count) project(s) already done in earlier report(s), $($projects.Count) left." -ForegroundColor Cyan
+}
+
 $i = 0
 foreach ($p in $projects) {
     $i++
     Write-Host ("({0}/{1}) {2}" -f $i, $projects.Count, $p.name)
     $results += Invoke-CxProject $p
     if ($script:TokenExpired) {
-        Write-Warning "Login expired after $i of $($projects.Count) projects. Writing a partial report - copy a fresh value and re-run (use -NameFilter to target the rest)."
+        Write-Warning "Login expired after $i of $($projects.Count) projects. Writing a partial report."
         break
     }
 }
@@ -552,10 +598,24 @@ $csv     = Join-Path $outFull "cx_riskzero_toverify_$stamp.csv"
 $xlsx    = Join-Path $outFull "cx_riskzero_toverify_$stamp.xlsx"
 
 $order = @{ 'YES' = 0; 'ERROR' = 1; 'NO' = 2; 'N/A' = 3; 'SKIPPED' = 4 }
-$sorted = $results | Sort-Object @{ Expression = { $order["$($_.'Needs Triage')"] } }, @{ Expression = { $_.'To Verify - Total' }; Descending = $true }, 'Project Name'
+$columns = @('Project ID','Project Name','Latest Scan ID','Risk Score','Scan Date','Was Locked','Lock Action',
+             'To Verify - Total','Critical','High','Medium','Low','Information','Needs Triage','Scan URL','Note','Error')
+$all = @($previous | Select-Object $columns) + @($results | Select-Object $columns)
+$results = $all
+$sorted = $all | Sort-Object @{ Expression = { $order["$($_.'Needs Triage')"] } }, @{ Expression = { [int]("0" + $_.'To Verify - Total') }; Descending = $true }, 'Project Name'
 $sorted | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
 Write-Host "`nCSV written: $csv" -ForegroundColor Cyan
 if (Convert-CsvToXlsx $csv $xlsx) { Write-Host "Excel written: $xlsx" -ForegroundColor Cyan }
+
+if ($script:TokenExpired) {
+    $me2 = Split-Path -Leaf $PSCommandPath
+    $flt = ''
+    if ($StartsWith) { $flt += " -StartsWith $StartsWith" }
+    if ($NameFilter) { $flt += " -NameFilter $NameFilter" }
+    if ($DryRun)     { $flt += " -DryRun" }
+    Write-Host "`nTo carry on where it stopped: copy a fresh token in Edge, then run:" -ForegroundColor Yellow
+    Write-Host "   .\$me2$flt -Resume `"$csv`"" -ForegroundColor Yellow
+}
 
 # ---- console summary ------------------------------------------------------- #
 $yes     = @($results | Where-Object { $_.'Needs Triage' -eq 'YES' })
