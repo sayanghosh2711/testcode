@@ -1,4 +1,5 @@
--Resume "C:\Users\SG39673\Downloads\cx_riskzero_toverify_20261031_1708.csv"<#
+   .\CxAutoclose.ps1 -StartsWith 177674 -Resume "C:\Users\SG39673\Downloads\cx_riskzero_toverify_20261031_1717.csv"
+<#
 .SYNOPSIS
   Checkmarx CxSAST 9.7 - for every project whose LATEST scan has Risk Level Score 0:
     1. lock the latest scan if it is unlocked
@@ -26,6 +27,7 @@ param(
     [switch]$DryRun,                 # report only, never lock anything
     [int]   $ReportTimeoutMinutes = 5,  # how long to wait for each XML report
     [string[]]$Resume = @(),         # previous report CSV(s): skip projects already done, merge into one report
+    [int]   $DelayMs = 500,          # pause before every API call so we don't overload the shared server
     [switch]$Diagnose,               # print what the API returns for ONE project, change nothing
     [string]$Token      = $env:CX_TOKEN,    # bearer token OR the full Cookie value - auto-detected
     [string]$OutDir     = ".",
@@ -35,6 +37,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $script:TokenExpired = $false
+$script:RateLimited  = $false
 
 $HelpText = @"
 
@@ -151,7 +154,9 @@ function Invoke-Cx {
     }
     foreach ($k in $Headers.Keys) { $h[$k] = $Headers[$k] }
 
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
+    $rateWaits = 0
+    for ($attempt = 1; $attempt -le 8; $attempt++) {
+        if ($DelayMs -gt 0) { Start-Sleep -Milliseconds $DelayMs }
         try {
             $p = @{ Method = $Method; Uri = $Url; Headers = $h; UseBasicParsing = $true; TimeoutSec = 180 }
             if ($null -ne $Body)  { $p.Body = $Body }
@@ -173,6 +178,24 @@ function Invoke-Cx {
             if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
             if ($code -eq 401 -or $_.Exception.Message -eq 'LOGIN_PAGE') {
                 throw "HTTP 401 - your login has expired or was not accepted. Log in again in Edge, copy a fresh value and re-run (see -Help). [failed call: $Method $Url]"
+            }
+            if ($code -eq 429) {
+                # Checkmarx is throttling us (Too Many Requests). Back off politely:
+                # wait as long as the server asks (or 30s, then longer), slow down
+                # every later call, and give up after a few waits instead of hammering.
+                $rateWaits++
+                if ($rateWaits -gt 4) {
+                    throw "RATE_LIMITED - Checkmarx kept refusing with HTTP 429 (too many requests) for $Url"
+                }
+                $wait = 30 * $rateWaits
+                try {
+                    $ra = $_.Exception.Response.Headers['Retry-After']
+                    if ($ra -match '^\d+$' -and [int]$ra -gt $wait) { $wait = [int]$ra }
+                } catch { }
+                $script:DelayMs = [math]::Min([math]::Max($script:DelayMs * 2, 1000), 5000)
+                Write-Host "   Checkmarx says 'too many requests' - waiting $wait s, then slowing down to one call every $($script:DelayMs) ms..." -ForegroundColor Yellow
+                Start-Sleep -Seconds $wait
+                continue
             }
             if ($attempt -lt 3 -and ($code -eq 0 -or $code -ge 500)) {
                 Start-Sleep -Seconds ([math]::Pow(2, $attempt))
@@ -441,6 +464,7 @@ function Invoke-CxProject($Project) {
         if (-not $row['Needs Triage']) { $row['Needs Triage'] = 'ERROR' }
         Write-Host "   ERROR: $_" -ForegroundColor Red
         if ("$_" -match 'HTTP 401') { $script:TokenExpired = $true }   # token gone - stop after this project
+        if ("$_" -match 'RATE_LIMITED') { $script:RateLimited = $true } # server overloaded - stop, don't hammer it
     }
     return [pscustomobject]$row
 }
@@ -588,6 +612,10 @@ foreach ($p in $projects) {
         Write-Warning "Login expired after $i of $($projects.Count) projects. Writing a partial report."
         break
     }
+    if ($script:RateLimited) {
+        Write-Warning "Checkmarx is rate-limiting this account after $i of $($projects.Count) projects. Stopping so we don't overload it - wait 10-15 minutes, then resume."
+        break
+    }
 }
 
 # ---- report ---------------------------------------------------------------- #
@@ -607,13 +635,14 @@ $sorted | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
 Write-Host "`nCSV written: $csv" -ForegroundColor Cyan
 if (Convert-CsvToXlsx $csv $xlsx) { Write-Host "Excel written: $xlsx" -ForegroundColor Cyan }
 
-if ($script:TokenExpired) {
+if ($script:TokenExpired -or $script:RateLimited) {
     $me2 = Split-Path -Leaf $PSCommandPath
     $flt = ''
     if ($StartsWith) { $flt += " -StartsWith $StartsWith" }
     if ($NameFilter) { $flt += " -NameFilter $NameFilter" }
     if ($DryRun)     { $flt += " -DryRun" }
-    Write-Host "`nTo carry on where it stopped: copy a fresh token in Edge, then run:" -ForegroundColor Yellow
+    $wait = ''; if ($script:RateLimited) { $wait = 'wait 10-15 minutes, ' }
+    Write-Host "`nTo carry on where it stopped: $($wait)copy a fresh token in Edge, then run:" -ForegroundColor Yellow
     Write-Host "   .\$me2$flt -Resume `"$csv`"" -ForegroundColor Yellow
 }
 
