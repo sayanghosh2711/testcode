@@ -24,6 +24,7 @@ param(
     [switch]$AnyRisk,                # ignore the risk score and open every project
     [int]   $Limit      = 0,         # only process the first N projects (testing)
     [switch]$DryRun,                 # report only, never lock anything
+    [switch]$Diagnose,               # print what the API returns for ONE project, change nothing
     [string]$Token      = $env:CX_TOKEN,    # bearer token OR the full Cookie value - auto-detected
     [string]$OutDir     = ".",
     [switch]$SkipCertCheck,          # only if you get SSL/TLS trust errors
@@ -425,6 +426,57 @@ function Convert-CsvToXlsx([string]$CsvPath, [string]$XlsxPath) {
 }
 
 # --------------------------------------------------------------------------- #
+# diagnose mode: show raw API answers for one project, change nothing
+# --------------------------------------------------------------------------- #
+function Invoke-CxDiagnose($Project) {
+    $lines = New-Object System.Collections.ArrayList
+    function Add-Line([string]$t) { [void]$lines.Add($t); Write-Host $t }
+
+    Add-Line "=== DIAGNOSE: $($Project.name)  (project id $($Project.id)) ==="
+    Add-Line "Login type: $script:AuthMode"
+
+    $scan = $null
+    try {
+        $scan = Get-LatestScan $Project.id
+        if ($scan) {
+            Add-Line "`n--- [1] REST latest scan: OK ---"
+            Add-Line ($scan | ConvertTo-Json -Depth 4)
+        } else { Add-Line "`n--- [1] REST latest scan: OK but no finished scan returned ---" }
+    } catch { Add-Line "`n--- [1] REST latest scan: FAILED ---`n$_" }
+
+    if ($scan) {
+        $sid = [int]$scan.id
+        try {
+            $o = Get-CxOData "/Scans($sid)"
+            Add-Line "`n--- [2] OData scan: OK ---"
+            Add-Line ($o | ConvertTo-Json -Depth 3)
+        } catch { Add-Line "`n--- [2] OData scan: FAILED ---`n$_" }
+
+        foreach ($f in 'StateId', 'State') {
+            try {
+                $r = Get-CxOData "/Scans($sid)/Results?`$filter=$f%20eq%200&`$top=2"
+                Add-Line "`n--- [3] OData To Verify using '$f': OK, sample rows: $(@($r.value).Count) ---"
+                if (@($r.value).Count -gt 0) { Add-Line (@($r.value)[0] | ConvertTo-Json -Depth 2) }
+                break
+            } catch { Add-Line "`n--- [3] OData To Verify using '$f': FAILED ---`n$_" }
+        }
+
+        try {
+            $st = Get-CxRest "/sast/scans/$sid/resultsStatistics"
+            Add-Line "`n--- [4] REST results statistics: OK ---"
+            Add-Line ($st | ConvertTo-Json -Depth 3)
+        } catch { Add-Line "`n--- [4] REST results statistics: FAILED ---`n$_" }
+
+        Add-Line "`nRisk score the script would use: $(Get-ScanRiskScore $scan)"
+    }
+
+    $file = Join-Path (Resolve-Path $OutDir).Path ("cx_diagnose_{0}.txt" -f (Get-Date -Format 'yyyyMMdd_HHmm'))
+    $lines | Out-File -FilePath $file -Encoding UTF8
+    Write-Host "`nSaved to: $file" -ForegroundColor Cyan
+    Write-Host "This file contains no login details. Send it (or paste its text) to whoever is helping you." -ForegroundColor Cyan
+}
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 Write-Host "Checkmarx: $BaseUrl"
@@ -441,6 +493,7 @@ $projects = @(Get-CxRest '/projects' | ForEach-Object { $_ } |
               Where-Object { -not $StartsWith -or $_.name -like "$StartsWith*" } |
               Sort-Object name)
 if ($Limit -gt 0) { $projects = @($projects | Select-Object -First $Limit) }
+if ($Diagnose -and $projects.Count -gt 0) { Invoke-CxDiagnose $projects[0]; return }
 if ($projects.Count -eq 0) { Write-Warning "No projects matched (NameFilter '$NameFilter', StartsWith '$StartsWith')."; return }
 
 if ($AnyRisk) { Write-Host "$($projects.Count) project(s) matched. Risk filter OFF." }
