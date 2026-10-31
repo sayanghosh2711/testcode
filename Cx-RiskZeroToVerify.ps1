@@ -262,8 +262,8 @@ function Lock-CxScan([int]$ScanId) {
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
     <LockScan xmlns="http://Checkmarx.com">
-      <sessionID></sessionID>
-      <scanId>$ScanId</scanId>
+      <i_SessionID></i_SessionID>
+      <i_ScanID>$ScanId</i_ScanID>
     </LockScan>
   </soap:Body>
 </soap:Envelope>
@@ -577,6 +577,3 @@ if ($yes.Count -gt 0) {
     }
 }
 Write-Host ("=" * 70)
-
-
-https://securecodeanalysis02.citigroup.net/cxwebinterface/Portal/CxWebService.asmx?op=LockScan
