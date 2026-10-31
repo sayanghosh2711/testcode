@@ -19,11 +19,12 @@
 param(
     [string]$BaseUrl    = "https://securecodeanalysis02.citigroup.net",
     [string]$NameFilter = "",        # part of the project name, e.g. 171532
+    [string]$StartsWith = "",        # project name must START with this, e.g. 123278
     [int]   $RiskScore  = 0,         # only open projects whose latest scan has this score
     [switch]$AnyRisk,                # ignore the risk score and open every project
     [int]   $Limit      = 0,         # only process the first N projects (testing)
     [switch]$DryRun,                 # report only, never lock anything
-    [string]$Token      = $env:CX_TOKEN,
+    [string]$Token      = $env:CX_TOKEN,    # bearer token OR the full Cookie value - auto-detected
     [string]$OutDir     = ".",
     [switch]$SkipCertCheck,          # only if you get SSL/TLS trust errors
     [switch]$Help
@@ -34,22 +35,32 @@ $script:TokenExpired = $false
 
 $HelpText = @"
 
-HOW TO GET THE TOKEN (SSO users)
---------------------------------
-1. Log in to Checkmarx in Edge as usual.
-2. Press F12 -> Network tab -> tick "Preserve log".
-3. Click around Checkmarx (e.g. Projects & Scans) until requests with
-   'cxrestapi' in the name appear.
-4. Click one -> Headers -> Request Headers -> find
-       Authorization: Bearer eyJhbGciOi...
-   Right-click the value -> Copy value  (it is very long - copy all of it).
-   If there is no Authorization header, use Application -> Session storage ->
-   key starting 'oidc.user:' and copy the access_token value instead.
-5. Run this script. When it asks, make sure the token is on your clipboard and
-   press Enter. The script reads it from the clipboard, then clears the clipboard.
+HOW TO GIVE THE SCRIPT YOUR LOGIN (SSO users)
+---------------------------------------------
+The script accepts either of two things from your logged-in Edge session.
+It works out which one you gave it.
 
-The token lasts about an hour and carries YOUR permissions. Treat it like a
-password: do not paste it into chats, tickets or files.
+OPTION 1 - Session cookie (use this if you see no "Authorization" header)
+1. Log in to Checkmarx in Edge as usual.
+2. Press F12 -> Network tab -> tick "Preserve log" -> type cxrestapi in the
+   filter box.
+3. Click around Checkmarx (e.g. Projects & Scans) so requests appear.
+4. Click a request named "Latest" or "scansQueue?projectId=..."
+   (NOT "openid-configuration").
+5. Headers -> Request Headers -> find the line called "Cookie".
+   Right-click its value -> Copy value. It is long and contains
+   ASP.NET_SessionId=...; ... CXCSRFToken=...  - copy all of it.
+
+OPTION 2 - Bearer token
+   Same steps, but copy the value of an "Authorization: Bearer eyJ..." line,
+   or the access_token from Application -> Session storage -> 'oidc.user:...'.
+
+Then run the script. When it asks, make sure the value is on your clipboard
+and press Enter. The script reads it from the clipboard, then clears it.
+
+Both are LIVE LOGIN CREDENTIALS carrying YOUR permissions. Never paste them
+into chats, tickets, emails or screenshots. Keep Edge logged in while the
+script runs; log out of Checkmarx when you are finished to end the session.
 
 "@
 if ($Help) { Write-Host $HelpText; return }
@@ -84,18 +95,37 @@ if ($BaseUrl -match '/cxwebclient$') { $BaseUrl = $BaseUrl -replace '/cxwebclien
 # token
 # --------------------------------------------------------------------------- #
 if (-not $Token) {
-    Write-Host "No token supplied." -ForegroundColor Yellow
-    Write-Host "Copy the bearer token from Edge DevTools (run with -Help for steps), then press Enter here..."
+    Write-Host "No login supplied." -ForegroundColor Yellow
+    Write-Host "Copy the Cookie value (or a Bearer token) from Edge DevTools - run with -Help for steps - then press Enter here..."
     [void](Read-Host)
     $Token = Get-Clipboard -Raw
-    try { Set-Clipboard -Value ' ' } catch { }   # don't leave the token sitting on the clipboard
+    try { Set-Clipboard -Value ' ' } catch { }   # don't leave the credential sitting on the clipboard
 }
-$Token = ("" + $Token) -replace '^\s*(Authorization:\s*)?Bearer\s+', ''
-$Token = $Token.Trim().Trim('"')
-if ($Token.Length -lt 200 -or $Token -notmatch '^eyJ') {
-    throw "That does not look like a Checkmarx bearer token (expected a long string starting with 'eyJ'). Run with -Help."
+$cred = ("" + $Token).Trim().Trim('"')
+$cred = $cred -replace '^\s*Cookie:\s*', ''
+$cred = $cred -replace '[\r\n]+', ''
+
+$script:AuthMode = $null
+$script:CxToken  = $null
+$script:CxCookie = $null
+$script:CxCsrf   = $null
+
+if ($cred -match '(^|;\s*)(ASP\.NET_SessionId|idsrv\.session|CXCSRFToken|\.AspNetCore\.)[^=]*=') {
+    $script:AuthMode = 'cookie'
+    $script:CxCookie = $cred
+    if ($cred -match 'CXCSRFToken=([^;\s]+)') { $script:CxCsrf = $Matches[1] }
+    else { Write-Warning "No CXCSRFToken found in the cookie - some calls may be refused. Copy the Cookie value from a 'Latest' request." }
+    Write-Host "Login type: session cookie" -ForegroundColor Cyan
 }
-$script:CxToken = $Token
+else {
+    $t = ($cred -replace '^\s*(Authorization:\s*)?Bearer\s+', '').Trim()
+    if ($t.Length -lt 200 -or $t -notmatch '^eyJ') {
+        throw "That doesn't look like a Checkmarx Cookie value or bearer token. Run with -Help for how to copy it."
+    }
+    $script:AuthMode = 'bearer'
+    $script:CxToken  = $t
+    Write-Host "Login type: bearer token" -ForegroundColor Cyan
+}
 
 # --------------------------------------------------------------------------- #
 # HTTP helpers
@@ -109,7 +139,12 @@ function Invoke-Cx {
         [string]$ContentType = $null,
         [switch]$Raw
     )
-    $h = @{ Authorization = "Bearer $script:CxToken" }
+    if ($script:AuthMode -eq 'cookie') {
+        $h = @{ Cookie = $script:CxCookie; 'X-Requested-With' = 'XMLHttpRequest' }
+        if ($script:CxCsrf) { $h['CXCSRFToken'] = $script:CxCsrf }
+    } else {
+        $h = @{ Authorization = "Bearer $script:CxToken" }
+    }
     foreach ($k in $Headers.Keys) { $h[$k] = $Headers[$k] }
 
     for ($attempt = 1; $attempt -le 3; $attempt++) {
@@ -117,14 +152,22 @@ function Invoke-Cx {
             $p = @{ Method = $Method; Uri = $Url; Headers = $h; UseBasicParsing = $true; TimeoutSec = 180 }
             if ($null -ne $Body)  { $p.Body = $Body }
             if ($ContentType)     { $p.ContentType = $ContentType }
-            if ($Raw) { return Invoke-WebRequest @p }
-            return Invoke-RestMethod @p
+            if ($Raw) {
+                $resp = Invoke-WebRequest @p
+                if ($resp.Content -match '<html' -and $resp.Content -notmatch 'soap:Envelope') {
+                    throw (New-Object System.Exception 'LOGIN_PAGE')
+                }
+                return $resp
+            }
+            $out = Invoke-RestMethod @p
+            if ($out -is [string] -and $out -match '<html') { throw (New-Object System.Exception 'LOGIN_PAGE') }
+            return $out
         }
         catch {
             $code = 0
             if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
-            if ($code -eq 401) {
-                throw "HTTP 401 - the token has expired or is invalid. Copy a fresh one from the browser and re-run (see -Help)."
+            if ($code -eq 401 -or $_.Exception.Message -eq 'LOGIN_PAGE') {
+                throw "HTTP 401 - your login has expired or was not accepted. Log in again in Edge, copy a fresh value and re-run (see -Help)."
             }
             if ($attempt -lt 3 -and ($code -eq 0 -or $code -ge 500)) {
                 Start-Sleep -Seconds ([math]::Pow(2, $attempt))
@@ -395,9 +438,10 @@ try {
 
 $projects = @(Get-CxRest '/projects' | ForEach-Object { $_ } |
               Where-Object { -not $NameFilter -or $_.name -like "*$NameFilter*" } |
+              Where-Object { -not $StartsWith -or $_.name -like "$StartsWith*" } |
               Sort-Object name)
 if ($Limit -gt 0) { $projects = @($projects | Select-Object -First $Limit) }
-if ($projects.Count -eq 0) { Write-Warning "No projects matched '$NameFilter'."; return }
+if ($projects.Count -eq 0) { Write-Warning "No projects matched (NameFilter '$NameFilter', StartsWith '$StartsWith')."; return }
 
 if ($AnyRisk) { Write-Host "$($projects.Count) project(s) matched. Risk filter OFF." }
 else          { Write-Host "$($projects.Count) project(s) matched. Only opening those with risk score $RiskScore." }
@@ -410,7 +454,7 @@ foreach ($p in $projects) {
     Write-Host ("({0}/{1}) {2}" -f $i, $projects.Count, $p.name)
     $results += Invoke-CxProject $p
     if ($script:TokenExpired) {
-        Write-Warning "Token expired after $i of $($projects.Count) projects. Writing a partial report - copy a fresh token and re-run (use -NameFilter to target the rest)."
+        Write-Warning "Login expired after $i of $($projects.Count) projects. Writing a partial report - copy a fresh value and re-run (use -NameFilter to target the rest)."
         break
     }
 }
