@@ -167,7 +167,7 @@ function Invoke-Cx {
             $code = 0
             if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
             if ($code -eq 401 -or $_.Exception.Message -eq 'LOGIN_PAGE') {
-                throw "HTTP 401 - your login has expired or was not accepted. Log in again in Edge, copy a fresh value and re-run (see -Help)."
+                throw "HTTP 401 - your login has expired or was not accepted. Log in again in Edge, copy a fresh value and re-run (see -Help). [failed call: $Method $Url]"
             }
             if ($attempt -lt 3 -and ($code -eq 0 -or $code -ge 500)) {
                 Start-Sleep -Seconds ([math]::Pow(2, $attempt))
