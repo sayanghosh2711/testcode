@@ -1,4 +1,4 @@
-<#
+-Resume "C:\Users\SG39673\Downloads\cx_riskzero_toverify_20261031_1708.csv"<#
 .SYNOPSIS
   Checkmarx CxSAST 9.7 - for every project whose LATEST scan has Risk Level Score 0:
     1. lock the latest scan if it is unlocked
