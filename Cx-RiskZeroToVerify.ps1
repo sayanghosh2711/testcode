@@ -24,6 +24,7 @@ param(
     [switch]$AnyRisk,                # ignore the risk score and open every project
     [int]   $Limit      = 0,         # only process the first N projects (testing)
     [switch]$DryRun,                 # report only, never lock anything
+    [int]   $ReportTimeoutMinutes = 5,  # how long to wait for each XML report
     [switch]$Diagnose,               # print what the API returns for ONE project, change nothing
     [string]$Token      = $env:CX_TOKEN,    # bearer token OR the full Cookie value - auto-detected
     [string]$OutDir     = ".",
@@ -138,7 +139,8 @@ function Invoke-Cx {
         [hashtable]$Headers = @{},
         $Body = $null,
         [string]$ContentType = $null,
-        [switch]$Raw
+        [switch]$Raw,
+        [string]$OutFile = $null
     )
     if ($script:AuthMode -eq 'cookie') {
         $h = @{ Cookie = $script:CxCookie; 'X-Requested-With' = 'XMLHttpRequest' }
@@ -153,6 +155,7 @@ function Invoke-Cx {
             $p = @{ Method = $Method; Uri = $Url; Headers = $h; UseBasicParsing = $true; TimeoutSec = 180 }
             if ($null -ne $Body)  { $p.Body = $Body }
             if ($ContentType)     { $p.ContentType = $ContentType }
+            if ($OutFile) { Invoke-WebRequest @p -OutFile $OutFile; return }
             if ($Raw) {
                 $resp = Invoke-WebRequest @p
                 if ($resp.Content -match '<html' -and $resp.Content -notmatch 'soap:Envelope') {
@@ -219,12 +222,27 @@ function Get-LatestScan([int]$ProjectId) {
     return ($scans | Sort-Object { $_.dateAndTime.startedOn } -Descending | Select-Object -First 1)
 }
 
+$script:RiskNote = ''
 function Get-ScanRiskScore($Scan) {
     # Risk Level Score = the number in brackets next to the coloured bar in the UI.
+    # The REST scan object carries it as 'scanRisk'. Checkmarx returns -1 when it
+    # did not calculate a score; the website then shows (0). In that case we check
+    # the scan's result counts: no Critical/High/Medium results = score 0.
+    $script:RiskNote = ''
     $names = @('scanRisk', 'riskScore', 'RiskScore', 'ScanRisk', 'riskLevelScore', 'RiskLevelScore')
     $v = Get-NumericProp $Scan $names 'risk' 'severity'
-    if ($null -ne $v) { return $v }
-    return (Get-NumericProp (Get-ODataScan $Scan.id) $names 'risk' 'severity')
+    if ($null -eq $v -or $v -ge 0) { return $v }
+
+    try   { $st = Get-CxRest "/sast/scans/$($Scan.id)/resultsStatistics" }
+    catch { $script:RiskNote = "scanRisk=$v and result counts unavailable"; return $null }
+    $crit = 0; if ($st.PSObject.Properties['criticalSeverity']) { $crit = [int]$st.criticalSeverity }
+    $chm  = $crit + [int]$st.highSeverity + [int]$st.mediumSeverity
+    if ($chm -eq 0) {
+        $script:RiskNote = "Checkmarx did not calculate a risk score (scanRisk=$v); treated as 0 because there are no Critical/High/Medium results"
+        return 0
+    }
+    $script:RiskNote = "Checkmarx did not calculate a risk score (scanRisk=$v); not 0 because there are $chm Critical/High/Medium results"
+    return $v
 }
 
 function Test-ScanLocked($Scan) {
@@ -262,29 +280,46 @@ function Lock-CxScan([int]$ScanId) {
     return @{ Ok = $false; Msg = $msg }
 }
 
-$script:StateField = $null   # discovered on first use: 'StateId' or 'State'
 function Get-ToVerifyResults([int]$ScanId) {
-    # To Verify = result state 0 (same as the Result State = "To Verify" filter in the viewer).
-    $fields = @('StateId', 'State')
-    if ($script:StateField) { $fields = @($script:StateField) }
-    $lastErr = $null
-    foreach ($f in $fields) {
-        try {
-            $all = @(); $skip = 0; $page = 1000
-            do {
-                $resp = Get-CxOData "/Scans($ScanId)/Results?`$filter=$f%20eq%200&`$select=Id,Severity&`$top=$page&`$skip=$skip"
-                $vals = @($resp.value)
-                $all += $vals
-                $skip += $page
-            } while ($vals.Count -eq $page)
-            $script:StateField = $f
-            return ,$all
-        } catch {
-            $lastErr = $_
-            if ($_.Exception.Data['StatusCode'] -ne 400) { throw }
+    # To Verify = result state 0 (same as the Result State = "To Verify" filter in
+    # the viewer). The OData API needs extra permissions most users don't have, so
+    # this asks Checkmarx for the scan's XML report - the same report you can
+    # create from the website - and counts results with state="0" in it.
+    $body = (@{ reportType = 'XML'; scanId = $ScanId } | ConvertTo-Json)
+    $req  = Invoke-Cx -Method POST -Url "$BaseUrl/cxrestapi/reports/sastScan" `
+                      -Headers @{ Accept = 'application/json;v=1.0' } `
+                      -Body $body -ContentType 'application/json;v=1.0'
+    $reportId = $req.reportId
+    if (-not $reportId) { throw "Checkmarx did not return a report id for scan $ScanId" }
+
+    $deadline = (Get-Date).AddMinutes($ReportTimeoutMinutes)
+    do {
+        Start-Sleep -Seconds 3
+        $st = Get-CxRest "/reports/sastScan/$reportId/status"
+        $state = "$($st.status.value)"
+        if ($state -eq 'Failed') { throw "Checkmarx failed to create the XML report for scan $ScanId" }
+        if ((Get-Date) -gt $deadline) { throw "XML report for scan $ScanId not ready after $ReportTimeoutMinutes min (try -ReportTimeoutMinutes 15)" }
+    } while ($state -ne 'Created')
+
+    $tmp = Join-Path $env:TEMP ("cx_scan_{0}_{1}.xml" -f $ScanId, $reportId)
+    try {
+        Invoke-Cx -Url "$BaseUrl/cxrestapi/reports/sastScan/$reportId" -Headers @{ Accept = '*/*' } -OutFile $tmp
+        $text = Get-Content -Path $tmp -Raw -Encoding UTF8
+        if ($text -match '<html' -and $text -notmatch '<CxXMLResults') { throw "HTTP 401 - your login has expired or was not accepted (report download returned the login page)." }
+        [xml]$doc = $text
+    } finally {
+        Remove-Item -Path $tmp -ErrorAction SilentlyContinue
+    }
+
+    $out = @()
+    foreach ($q in @($doc.SelectNodes('//Query'))) {
+        foreach ($r in @($q.SelectNodes("Result[@state='0']"))) {
+            $sev = $r.GetAttribute('Severity')
+            if (-not $sev) { $sev = $q.GetAttribute('Severity') }
+            $out += [pscustomobject]@{ Severity = $sev; Query = $q.GetAttribute('name') }
         }
     }
-    throw "Could not query To Verify results: $lastErr"
+    return ,$out
 }
 
 function ConvertTo-SeverityName($v) {
@@ -317,6 +352,7 @@ function Invoke-CxProject($Project) {
         'Information'       = 0
         'Needs Triage'      = ''
         'Scan URL'          = ''
+        'Note'              = ''
         'Error'             = ''
     }
     try {
@@ -333,6 +369,7 @@ function Invoke-CxProject($Project) {
         # ---- risk score gate: only score-0 projects are opened ------------- #
         $risk = Get-ScanRiskScore $scan
         $row['Risk Score'] = $risk
+        $row['Note'] = $script:RiskNote
         if (-not $AnyRisk) {
             if ($null -eq $risk) {
                 $row['Needs Triage'] = 'SKIPPED'; $row['Lock Action'] = 'Not touched'
@@ -447,27 +484,22 @@ function Invoke-CxDiagnose($Project) {
     if ($scan) {
         $sid = [int]$scan.id
         try {
-            $o = Get-CxOData "/Scans($sid)"
-            Add-Line "`n--- [2] OData scan: OK ---"
-            Add-Line ($o | ConvertTo-Json -Depth 3)
-        } catch { Add-Line "`n--- [2] OData scan: FAILED ---`n$_" }
-
-        foreach ($f in 'StateId', 'State') {
-            try {
-                $r = Get-CxOData "/Scans($sid)/Results?`$filter=$f%20eq%200&`$top=2"
-                Add-Line "`n--- [3] OData To Verify using '$f': OK, sample rows: $(@($r.value).Count) ---"
-                if (@($r.value).Count -gt 0) { Add-Line (@($r.value)[0] | ConvertTo-Json -Depth 2) }
-                break
-            } catch { Add-Line "`n--- [3] OData To Verify using '$f': FAILED ---`n$_" }
-        }
+            Add-Line "`n--- [2] To Verify via XML report: requesting (can take a minute) ---"
+            $tv = Get-ToVerifyResults $sid
+            Add-Line "--- [2] To Verify via XML report: OK, To Verify results = $($tv.Count) ---"
+            if ($tv.Count -gt 0) { Add-Line ($tv | Group-Object Severity | ForEach-Object { "   $($_.Name): $($_.Count)" } | Out-String) }
+        } catch { Add-Line "--- [2] To Verify via XML report: FAILED ---`n$_" }
 
         try {
             $st = Get-CxRest "/sast/scans/$sid/resultsStatistics"
-            Add-Line "`n--- [4] REST results statistics: OK ---"
+            Add-Line "`n--- [3] REST results statistics: OK ---"
             Add-Line ($st | ConvertTo-Json -Depth 3)
-        } catch { Add-Line "`n--- [4] REST results statistics: FAILED ---`n$_" }
+        } catch { Add-Line "`n--- [3] REST results statistics: FAILED ---`n$_" }
 
-        Add-Line "`nRisk score the script would use: $(Get-ScanRiskScore $scan)"
+        $rs = Get-ScanRiskScore $scan
+        Add-Line "`nRisk score the script would use: $rs"
+        if ($script:RiskNote) { Add-Line "   ($script:RiskNote)" }
+        Add-Line "Locked right now: $(Test-ScanLocked $scan)"
     }
 
     $file = Join-Path (Resolve-Path $OutDir).Path ("cx_diagnose_{0}.txt" -f (Get-Date -Format 'yyyyMMdd_HHmm'))
