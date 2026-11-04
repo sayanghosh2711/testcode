@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     1. Reads file 1 (e.g. "177674 scans.csv") -> "Tracking ID" column,
-       converts "177674:xxxx" -> "177674_xxxx".
+       converts "11111:xxxx" -> "11111_xxxx".
     2. Reads file 2 (e.g. "ProjectState (19).csv") -> "Project Name" column,
        strips the trailing "_ICG" / "_EB" suffix.
     3. Marks every project Active / Inactive (same as the COUNTIF formula,
@@ -19,10 +19,10 @@
     Works on Windows PowerShell 5.1 and PowerShell 7+. No Excel install needed.
 
 .EXAMPLE
-    .\Remove-Inactive.ps1 -InactiveFile "177674 scans.csv" -ProjectFile "ProjectState (19).csv"
+    .\Remove-Inactive.ps1 -InactiveFile "11111 scans.csv" -ProjectFile "ProjectState (19).csv"
 
 .EXAMPLE
-    .\Remove-Inactive.ps1 "177674 scans.csv" "ProjectState (19).csv" -Suffixes "_ICG","_EB","_XYZ"
+    .\Remove-Inactive.ps1 "11111 scans.csv" "ProjectState (19).csv" -Suffixes "_ICG","_EB","_XYZ"
 
 .EXAMPLE
     # If scripts are blocked by execution policy:
