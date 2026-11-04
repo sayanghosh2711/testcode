@@ -9,17 +9,17 @@
 
 .EXAMPLE
   # Safe test - 3 projects, locks nothing. Copy the token first (see -Help).
-  .\Cx-RiskZeroToVerify.ps1 -NameFilter 171532 -Limit 3 -DryRun
+  .\Cx-RiskZeroToVerify.ps1 -NameFilter 1111 -Limit 3 -DryRun
 
 .EXAMPLE
   # Real run
-  .\Cx-RiskZeroToVerify.ps1 -NameFilter 171532
+  .\Cx-RiskZeroToVerify.ps1 -NameFilter 1111
 #>
 [CmdletBinding()]
 param(
     [string]$BaseUrl    = "https://securecodeanalysis02.citigroup.net",
-    [string]$NameFilter = "",        # part of the project name, e.g. 171532
-    [string]$StartsWith = "",        # project name must START with this, e.g. 123278
+    [string]$NameFilter = "",        # part of the project name, e.g. 1111
+    [string]$StartsWith = "",        # project name must START with this, e.g. 1111
     [int]   $RiskScore  = 0,         # only open projects whose latest scan has this score
     [switch]$AnyRisk,                # ignore the risk score and open every project
     [int]   $Limit      = 0,         # only process the first N projects (testing)
