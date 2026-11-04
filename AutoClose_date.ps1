@@ -1,4 +1,5 @@
 <#
+.\CxAutoclose.ps1 -StartsWith 1111 -FromDate 2024-12-12 -Limit 5 -DryRun
 .SYNOPSIS
   Checkmarx CxSAST 9.7 - for every project whose LATEST scan has Risk Level Score 0:
     1. lock the latest scan if it is unlocked
@@ -9,17 +10,17 @@
 
 .EXAMPLE
   # Safe test - 3 projects, locks nothing. Copy the token first (see -Help).
-  .\Cx-RiskZeroToVerify.ps1 -NameFilter 171532 -Limit 3 -DryRun
+  .\Cx-RiskZeroToVerify.ps1 -NameFilter 111 -Limit 3 -DryRun
 
 .EXAMPLE
   # Real run
-  .\Cx-RiskZeroToVerify.ps1 -NameFilter 171532
+  .\Cx-RiskZeroToVerify.ps1 -NameFilter 11111
 #>
 [CmdletBinding()]
 param(
     [string]$BaseUrl    = "https://securecodeanalysis02.citigroup.net",
-    [string]$NameFilter = "",        # part of the project name, e.g. 171532
-    [string]$StartsWith = "",        # project name must START with this, e.g. 123278
+    [string]$NameFilter = "",        # part of the project name, e.g. 1111
+    [string]$StartsWith = "",        # project name must START with this, e.g. 1111
     [int]   $RiskScore  = 0,         # only open projects whose latest scan has this score
     [switch]$AnyRisk,
     [string]$FromDate   = "",        # only projects whose LATEST scan is on/after this date, e.g. 2024-12-12
