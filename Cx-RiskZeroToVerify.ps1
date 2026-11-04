@@ -1,4 +1,3 @@
-   .\CxAutoclose.ps1 -StartsWith 177674 -Resume "C:\Users\SG39673\Downloads\cx_riskzero_toverify_20261031_1717.csv"
 <#
 .SYNOPSIS
   Checkmarx CxSAST 9.7 - for every project whose LATEST scan has Risk Level Score 0:
