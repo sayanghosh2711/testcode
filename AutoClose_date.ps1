@@ -1,5 +1,7 @@
 <#
 .\CxAutoclose.ps1 -StartsWith 1111 -FromDate 2024-12-12 -Limit 5 -DryRun
+# a range, both days included
+.\CxAutoclose.ps1 -StartsWith 177674 -FromDate 2024-12-12 -ToDate 2025-06-30
 .SYNOPSIS
   Checkmarx CxSAST 9.7 - for every project whose LATEST scan has Risk Level Score 0:
     1. lock the latest scan if it is unlocked
